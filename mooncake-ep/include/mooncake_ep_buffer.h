@@ -71,7 +71,7 @@ struct MooncakeEpBuffer {
     void* gdr_buffer = nullptr;
 
     // IBGDA
-    static constexpr size_t CTRL_BUF_SIZE = 1024 * 1024 * 1024;  // 1024 MiB
+    static constexpr size_t CTRL_BUF_SIZE = 1024ULL * 1024 * 1024;  // 1024 MiB
     void* ctrl_buf = nullptr;
     // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
     // fails.
@@ -85,6 +85,11 @@ struct MooncakeEpBuffer {
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
     int gid_index_ = -1;  // Dynamically discovered GID index
+
+    mlx5dv_devx_umem* ctrl_buf_umem;
+    ibv_pd* pd;
+    mlx5dv_pd mpd;
+    memheap* ctrl_buf_heap;
 
     // NVLink P2P
     int32_t* nvlink_available = nullptr;
@@ -155,6 +160,8 @@ struct MooncakeEpBuffer {
         }
         return p2p_ipc_all_enabled_;
     }
+
+    void update_local_qpns();
 
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,
