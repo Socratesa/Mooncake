@@ -270,7 +270,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
-    connection_ctx->waitUntilActiveRanksConnected();
+    connection_ctx->waitUntilNewRanksConnected();
 
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
@@ -346,7 +346,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
-    connection_ctx->waitUntilActiveRanksConnected();
+    connection_ctx->waitUntilNewRanksConnected();
 
     // TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     //  Alternately use even-odd items to maintain tasks

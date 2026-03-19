@@ -292,7 +292,7 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
-    connection_ctx_->waitUntilActiveRanksConnected();
+    connection_ctx_->waitUntilNewRanksConnected();
 
     (void)tag;
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
@@ -324,7 +324,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     std::vector<at::Tensor>& tensors, int srcRank, int tag) {
-    connection_ctx_->waitUntilActiveRanksConnected();
+    connection_ctx_->waitUntilNewRanksConnected();
 
     (void)tag;
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);

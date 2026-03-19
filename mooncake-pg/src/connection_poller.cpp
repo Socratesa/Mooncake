@@ -49,6 +49,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
     : backendIndex_(backendIndex),
       rank_(rank),
       groupSize_(size),
+      establishedGroupSize_(0),
       local2global_rank_map_(local2global_rank_map),
       store_(std::move(store)),
       meta_(std::move(meta)),
@@ -126,31 +127,32 @@ void ConnectionContext::waitUntilAllConnected() {
         return isAllPeerConnected() ||
                isShutdown_.load(std::memory_order_acquire);
     });
+    establishedGroupSize_.store(groupSize_, std::memory_order_release);
 }
 
-bool ConnectionContext::isActiveRanksConnected() const {
-    if (isAllPeerConnected()) return true;
-
-    int size = groupSize_.load(std::memory_order_acquire);
-    bool has_unconnected_active = false;
-
-    // Keep it branchless for auto-vectorization
-    for (int i = 0; i < size; ++i) {
-        has_unconnected_active |=
-            (meta_->activeRanks[i] && !meta_->peerConnected[i]);
+void ConnectionContext::waitUntilNewRanksConnected() {
+    const int targetGroupSize = groupSize_.load(std::memory_order_acquire);
+    const int established =
+        establishedGroupSize_.load(std::memory_order_acquire);
+    if (established >= targetGroupSize) {
+        return;
     }
 
-    return !has_unconnected_active;
-}
-
-void ConnectionContext::waitUntilActiveRanksConnected() {
-    if (isActiveRanksConnected()) return;
-
     std::unique_lock<std::mutex> lock(backend_wakeup_mutex_);
-    backend_wakeup_cv_.wait(lock, [this]() {
-        return isActiveRanksConnected() ||
-               isShutdown_.load(std::memory_order_acquire);
+    backend_wakeup_cv_.wait(lock, [this, targetGroupSize, established]() {
+        if (isShutdown_.load(std::memory_order_acquire)) {
+            return true;
+        }
+
+        for (int i = established; i < targetGroupSize; ++i) {
+            if (!meta_->peerConnected[i]) {
+                return false;
+            }
+        }
+        return true;
     });
+
+    establishedGroupSize_.store(targetGroupSize, std::memory_order_release);
 }
 
 void ConnectionContext::shutdown() {
@@ -350,13 +352,6 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // reports a failure. We must set both to false here.
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
-
-            // Wake up backend in case they block on `waitUntilActiveRanksConnected` and 
-            // missed the activeRanks update.
-            {
-                std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
-                backend_wakeup_cv_.notify_all();
-            }
 
             // Reset store
             store_->deleteKey(

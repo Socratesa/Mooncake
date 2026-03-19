@@ -55,6 +55,13 @@ class ConnectionContext {
     int rank_;
 
     std::atomic<int> groupSize_;
+
+    // A mark tracking the group size for which all ranks
+    // in [0, establishedGroupSize_) have been successfully
+    // connected at least once (they may disconnect afterwards).
+    // Mainly used in `waitUntilNewRanksConnected()`.
+    std::atomic<int> establishedGroupSize_;
+
     uint64_t* local2global_rank_map_;
     c10::intrusive_ptr<::c10d::Store> store_;
 
@@ -98,8 +105,7 @@ class ConnectionContext {
     bool isAllPeerConnected() const;
     void waitUntilAllConnected();
 
-    bool isActiveRanksConnected() const;
-    void waitUntilActiveRanksConnected();
+    void waitUntilNewRanksConnected();
 
     void shutdown();
 
