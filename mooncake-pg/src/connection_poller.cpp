@@ -98,9 +98,18 @@ int ConnectionContext::getTotalConnectedPeers() const {
 }
 
 void ConnectionContext::extendGroupSizeTo(int newGroupSize) {
+    const int oldGroupSize = groupSize_.load(std::memory_order_acquire);
+    if (newGroupSize == oldGroupSize) return;
+
     TORCH_CHECK(
         newGroupSize >= 0 && static_cast<size_t>(newGroupSize) < kMaxNumRanks,
         "Size out of range");
+    TORCH_CHECK(newGroupSize >= oldGroupSize, "newGroupSize < oldGroupSize");
+
+    // Reset local peer state for newly added ranks
+    for (int i = oldGroupSize; i < newGroupSize; ++i) {
+        meta_->peerConnected[i] = false;
+    }
 
     groupSize_.store(newGroupSize, std::memory_order_release);
 }
@@ -341,6 +350,13 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // reports a failure. We must set both to false here.
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
+
+            // Wake up backend in case they block on `waitUntilActiveRanksConnected` and 
+            // missed the activeRanks update.
+            {
+                std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+                backend_wakeup_cv_.notify_all();
+            }
 
             // Reset store
             store_->deleteKey(

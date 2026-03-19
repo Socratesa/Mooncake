@@ -798,20 +798,31 @@ int MooncakeBackend::getNumSyncedRanks() {
     return tensors[0].cpu().item<int>();
 }
 
-void MooncakeBackend::extendGroupSizeTo(int size) {
-    TORCH_CHECK(size >= 0 && static_cast<size_t>(size) < kMaxNumRanks,
+void MooncakeBackend::extendGroupSizeTo(int newSize) {
+    const int oldSize = meta_->size;
+    if (newSize == oldSize) return;
+
+    TORCH_CHECK(newSize >= 0 && static_cast<size_t>(newSize) < kMaxNumRanks,
                 "Size out of range");
+    TORCH_CHECK(newSize >= oldSize, "newSize < oldSize");
 
     LOG(INFO) << "Backend " << backendIndex_ << " rank " << rank_
-              << ": Group size extend to " << size;
-    meta_->size = size;
-    meta_->taskCount = 0;
-    // TODO: compatibility with fault-tolerance
-    meta_->activeRanksTensor =
-        at::ones({size}, torch::dtype(torch::kInt32)
-                             .device(isCpu_ ? torch::kCPU : torch::kCUDA));
+              << ": Group size extend to " << newSize;
 
-    connection_ctx_->extendGroupSizeTo(size);
+    meta_->size = newSize;
+    meta_->taskCount = 0;
+
+    // Initialize new rank's metadata
+    for (int i = oldSize; i < newSize; ++i) {
+        local2global_rank_map_[i] = i;
+        meta_->activeRanks[i] = true;
+    }
+
+    auto& tensor = meta_->activeRanksTensor;
+    tensor.resize_({newSize});
+    tensor.slice(0, oldSize, newSize).fill_(1);
+
+    connection_ctx_->extendGroupSizeTo(newSize);
     // After extendGroupSizeTo, we don't `waitUntilActiveRanksConnected` here
     // but do it in the first task. This enables client code to overlap
     // execution between `extendGroupSizeTo` and the first communication call.
