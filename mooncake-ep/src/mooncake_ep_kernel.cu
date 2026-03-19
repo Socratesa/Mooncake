@@ -160,6 +160,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
          void* cuda_counter_buffer, void* cuda_data_buffer,
          void* raddrs, void* rkeys, void* qp_devctxs,
+         const int* qp_offsets,
          const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
          const void* x, const int64_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
@@ -196,7 +197,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -287,7 +287,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     } else {
                         if (lane_id == 0) {
                             uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                            auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
+                            int qp_start = __ldg(qp_offsets + dst_rank);
+                            int qp_count = __ldg(qp_offsets + dst_rank + 1) - qp_start;
+                            auto ctx = ctx_array + qp_start + dst_expert_local_idx % qp_count;
                             device_mutex_lock_system(&ctx->mutex);
                             __mlx5gda_device_write_rdma_write_wqe(ctx, src_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_msg);
                             __mlx5gda_device_post_send_db(ctx);
@@ -364,7 +366,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             } else {
                 uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
                 uint64_t rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
-                auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
+                int qp_start_s = __ldg(qp_offsets + dst_rank);
+                int qp_count_s = __ldg(qp_offsets + dst_rank + 1) - qp_start_s;
+                auto ctx = ctx_array + qp_start_s + dst_expert_local_idx % qp_count_s;
                 device_mutex_lock_system(&ctx->mutex);
                 __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, -num_tokens_sent - 1, laddr, device_byteswap(rkey_array[rank]), rptr_actual, device_byteswap(rkey_array[dst_rank]));
                 __mlx5gda_device_post_send_db(ctx);
@@ -472,6 +476,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
               void* cuda_counter_buffer, void* cuda_data_buffer,
               void* raddrs, void* rkeys, void* qp_devctxs,
+              const int* qp_offsets,
               const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
               const void* x, const int64_t* topk_idx,
               int* next_clean_buffer,
@@ -504,6 +509,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
               cuda_counter_buffer, cuda_data_buffer, \
               raddrs, rkeys, qp_devctxs, \
+              qp_offsets, \
               nvlink_available, ipc_peer_ptrs, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
@@ -524,6 +530,7 @@ combine(void* combined_x, int32_t* active_ranks,
         void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
         void* cuda_counter_buffer, void* cuda_data_buffer,
         void* raddrs, void* rkeys, void* qp_devctxs,
+        const int* qp_offsets,
         const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
         const void* x, const int64_t* topk_idx, const float* topk_weights,
         const int* src_info, const int64_t* layout_range,
@@ -556,7 +563,6 @@ combine(void* combined_x, int32_t* active_ranks,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -618,7 +624,9 @@ combine(void* combined_x, int32_t* active_ranks,
 
                     if (lane_id == 0) {
                         uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                        auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
+                        int qp_start_c = __ldg(qp_offsets + dst_rank);
+                        int qp_count_c = __ldg(qp_offsets + dst_rank + 1) - qp_start_c;
+                        auto ctx = ctx_array + qp_start_c + local_expert_idx % qp_count_c;
                         device_mutex_lock_system(&ctx->mutex);
                         __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) buf_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
                         __mlx5gda_device_post_send_db(ctx);
@@ -643,7 +651,9 @@ combine(void* combined_x, int32_t* active_ranks,
                 } else {
                     uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
                     uint64_t req_rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
-                    auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
+                    int qp_start_cs = __ldg(qp_offsets + dst_rank);
+                    int qp_count_cs = __ldg(qp_offsets + dst_rank + 1) - qp_start_cs;
+                    auto ctx = ctx_array + qp_start_cs + local_expert_idx % qp_count_cs;
                     device_mutex_lock_system(&ctx->mutex);
                     __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, laddr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]));
                     __mlx5gda_device_post_send_db(ctx);
@@ -727,6 +737,7 @@ void combine(void* combined_x, int32_t* active_ranks,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
              void* cuda_counter_buffer, void* cuda_data_buffer,
              void* raddrs, void* rkeys, void* qp_devctxs,
+             const int* qp_offsets,
              const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
              const void* x, const int64_t* topk_idx, const float* topk_weights,
              const int* src_info, const int64_t* layout_range,
@@ -756,6 +767,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
               cuda_counter_buffer, cuda_data_buffer, \
               raddrs, rkeys, qp_devctxs, \
+              qp_offsets, \
               nvlink_available, ipc_peer_ptrs, \
               x, topk_idx, topk_weights, src_info, layout_range, \
               next_clean_buffer, \
