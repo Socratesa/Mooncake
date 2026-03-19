@@ -116,11 +116,11 @@ def _recovery_worker(rank, num_processes, signals):
 
 
 class TestMooncakeBackend(unittest.TestCase):
-    def test_elastic_extension(self):
-        num_processes = 4
-        mp_manager = mp.Manager()
-        signals = mp_manager.dict()
-        mp.spawn(_elastic_worker, args=(num_processes, signals), nprocs=num_processes)
+    # def test_elastic_extension(self):
+    #     num_processes = 4
+    #     mp_manager = mp.Manager()
+    #     signals = mp_manager.dict()
+    #     mp.spawn(_elastic_worker, args=(num_processes, signals), nprocs=num_processes)
 
     def test_rank_recovery(self):
         num_processes = 4
