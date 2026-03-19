@@ -48,7 +48,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      TransferEngine* engine)
     : backendIndex_(backendIndex),
       rank_(rank),
-      size_(size),
+      groupSize_(size),
       local2global_rank_map_(local2global_rank_map),
       store_(std::move(store)),
       meta_(std::move(meta)),
@@ -77,7 +77,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
 }
 
 ConnectionContext::~ConnectionContext() {
-    for (int i = 0; i < size_; ++i) {
+    for (int i = 0; i < groupSize_; ++i) {
         if (peerStates_[i].segmentId.has_value()) {
             engine_->closeSegment(peerStates_[i].segmentId.value());
         }
@@ -93,10 +93,53 @@ ConnectionContext::~ConnectionContext() {
     }
 }
 
+int ConnectionContext::getTotalConnectedPeers() const {
+    return totalConnectedPeers_.load(std::memory_order_acquire);
+}
+
+void ConnectionContext::extendGroupSizeTo(int newGroupSize) {
+    TORCH_CHECK(
+        newGroupSize >= 0 && static_cast<size_t>(newGroupSize) < kMaxNumRanks,
+        "Size out of range");
+
+    groupSize_.store(newGroupSize, std::memory_order_release);
+}
+
+bool ConnectionContext::isAllPeerConnected() const {
+    return totalConnectedPeers_ == groupSize_;
+}
+
 void ConnectionContext::waitUntilAllConnected() {
+    if (isAllPeerConnected()) return;
+
     std::unique_lock<std::mutex> lock(backend_wakeup_mutex_);
     backend_wakeup_cv_.wait(lock, [this]() {
         return isAllPeerConnected() ||
+               isShutdown_.load(std::memory_order_acquire);
+    });
+}
+
+bool ConnectionContext::isActiveRanksConnected() const {
+    if (isAllPeerConnected()) return true;
+
+    int size = groupSize_.load(std::memory_order_acquire);
+    bool has_unconnected_active = false;
+
+    // Keep it branchless for auto-vectorization
+    for (int i = 0; i < size; ++i) {
+        has_unconnected_active |=
+            (meta_->activeRanks[i] && !meta_->peerConnected[i]);
+    }
+
+    return !has_unconnected_active;
+}
+
+void ConnectionContext::waitUntilActiveRanksConnected() {
+    if (isActiveRanksConnected()) return;
+
+    std::unique_lock<std::mutex> lock(backend_wakeup_mutex_);
+    backend_wakeup_cv_.wait(lock, [this]() {
+        return isActiveRanksConnected() ||
                isShutdown_.load(std::memory_order_acquire);
     });
 }
@@ -118,7 +161,7 @@ bool ConnectionContext::poll() {
     bool did_work = false;
 
     // Poll all peers sequentially.
-    for (int pollingRank = 0; pollingRank < size_; ++pollingRank) {
+    for (int pollingRank = 0; pollingRank < groupSize_; ++pollingRank) {
         did_work |= pollPeer(pollingRank);
     }
 
@@ -189,7 +232,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
                     totalConnectedPeers_.fetch_add(1,
                                                    std::memory_order_release);
-                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                    backend_wakeup_cv_.notify_all();
                 }
             } else if (pollingRank <= rank_) {
                 // Send a warmup request to establish connections
@@ -232,7 +275,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
                     totalConnectedPeers_.fetch_add(1,
                                                    std::memory_order_release);
-                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                    backend_wakeup_cv_.notify_all();
                 }
                 state_changed = true;
             } else if (status.s == TransferStatusEnum::FAILED) {
@@ -259,7 +302,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
                     totalConnectedPeers_.fetch_add(1,
                                                    std::memory_order_release);
-                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                    backend_wakeup_cv_.notify_all();
                 }
                 state_changed = true;
             }

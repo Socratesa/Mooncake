@@ -54,8 +54,7 @@ class ConnectionContext {
     int backendIndex_;
     int rank_;
 
-    // TODO: make it atomic and add `expandSize` to handle runtime scaling-up?
-    int size_;
+    std::atomic<int> groupSize_;
     uint64_t* local2global_rank_map_;
     c10::intrusive_ptr<::c10d::Store> store_;
 
@@ -92,12 +91,16 @@ class ConnectionContext {
     int32_t* warmup_send_region() const { return warmup_send_region_; }
     int32_t* warmup_recv_region() const { return warmup_recv_region_; }
 
-    int getTotalConnectedPeers() const {
-        return totalConnectedPeers_.load(std::memory_order_acquire);
-    }
-    bool isAllPeerConnected() const { return totalConnectedPeers_ == size_; }
+    int getTotalConnectedPeers() const;
 
+    void extendGroupSizeTo(int newGroupSize);
+
+    bool isAllPeerConnected() const;
     void waitUntilAllConnected();
+
+    bool isActiveRanksConnected() const;
+    void waitUntilActiveRanksConnected();
+
     void shutdown();
 
     static std::string getServerNameStoreKey(int backendIndex, int rank) {
