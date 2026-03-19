@@ -82,6 +82,7 @@ struct MooncakeEpBuffer {
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
+    int* qp_offsets = nullptr;  // device array, size = num_ranks + 1
     std::string device_name;
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
@@ -190,16 +191,22 @@ struct MooncakeEpBuffer {
     }
 
     std::vector<int32_t> get_local_qpns() {
+        // Only return the QPs that are actually used (base_qps per rank).
+        // The last (MAX_QP_COUNT % num_ranks) QPs are unused.
+        int qps_used = (MAX_QP_COUNT / num_ranks) * num_ranks;
         std::vector<int32_t> local_qpns;
-        for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        local_qpns.reserve(qps_used);
+        for (int i = 0; i < qps_used; ++i) {
             local_qpns.push_back((int32_t)qps[i]->qpn);
         }
         return local_qpns;
     }
 
     std::vector<int32_t> get_local_lids() {
+        int qps_used = (MAX_QP_COUNT / num_ranks) * num_ranks;
         std::vector<int32_t> local_lids;
-        for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        local_lids.reserve(qps_used);
+        for (int i = 0; i < qps_used; ++i) {
             local_lids.push_back((int32_t)qps[i]->port_attr.lid);
         }
         return local_lids;

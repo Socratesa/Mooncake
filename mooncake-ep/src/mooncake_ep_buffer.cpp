@@ -156,6 +156,21 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(
         cudaMalloc(&qp_devctxs, MAX_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
 
+    // Precompute per-rank QP offset table.
+    // Use equal floor division: every rank gets exactly base_qps = MAX_QP_COUNT / num_ranks QPs.
+    // The last (MAX_QP_COUNT % num_ranks) QPs are left unused (never connected).
+    // This guarantees symmetric RC QP pairing for any num_ranks.
+    CUDA_CHECK(cudaMalloc(&qp_offsets, (num_ranks + 1) * sizeof(int)));
+    {
+        int base_qps = MAX_QP_COUNT / num_ranks;
+        std::vector<int> qp_offsets_host(num_ranks + 1);
+        for (int r = 0; r <= num_ranks; ++r)
+            qp_offsets_host[r] = r * base_qps;
+        CUDA_CHECK(cudaMemcpy(qp_offsets, qp_offsets_host.data(),
+                              (num_ranks + 1) * sizeof(int),
+                              cudaMemcpyHostToDevice));
+    }
+
     // Allocate NVLink P2P arrays
     CUDA_CHECK(cudaMalloc(&nvlink_available, num_ranks * sizeof(int32_t)));
     CUDA_CHECK(cudaMemset(nvlink_available, 0, num_ranks * sizeof(int32_t)));
@@ -188,6 +203,7 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     cudaFree(raddrs);
     cudaFree(rkeys);
     cudaFree(qp_devctxs);
+    if (qp_offsets) cudaFree(qp_offsets);
     if (nvlink_available) cudaFree(nvlink_available);
     if (ipc_peer_ptrs) cudaFree(ipc_peer_ptrs);
     if (ipc_peer_ptrs_host) {
@@ -221,7 +237,6 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
                    x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
-    EP_HOST_ASSERT(MAX_QP_COUNT % num_ranks == 0);
 
     auto num_tokens = static_cast<int>(x.size(0)),
          hidden = static_cast<int>(x.size(1));
@@ -286,7 +301,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             gdr_buffer, buffer.rdma_send_signal_buffer,
             buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
             buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs, rkeys,
-            qp_devctxs, nvlink_available, ipc_peer_ptrs, x.data_ptr(),
+            qp_devctxs, qp_offsets, nvlink_available, ipc_peer_ptrs,
+            x.data_ptr(),
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
@@ -394,7 +410,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(), gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
             buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
-            nullptr, raddrs, rkeys, qp_devctxs, nvlink_available, ipc_peer_ptrs,
+            nullptr, raddrs, rkeys, qp_devctxs, qp_offsets,
+            nvlink_available, ipc_peer_ptrs,
             x.data_ptr(), topk_idx.data_ptr<int64_t>(),
             topk_weights.data_ptr<float>(), src_info.data_ptr<int>(),
             layout_range.data_ptr<int64_t>(),
@@ -615,7 +632,10 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
                                const std::vector<int32_t>& remote_keys,
                                const std::vector<int32_t>& remote_qpns,
                                const std::vector<int32_t>& remote_lids) {
-    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+    // remote_qpns / remote_lids have length qps_used = base_qps * num_ranks.
+    // QPs beyond qps_used are left in INIT state (unused).
+    int qps_used = (int)remote_qpns.size();
+    for (int i = 0; i < qps_used; ++i) {
         ibv_ah_attr ah_attr = {
             .dlid = (uint16_t)remote_lids[i],
             .port_num = 0,
@@ -646,12 +666,23 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
                                  const std::vector<int32_t>& remote_qpns,
                                  const std::vector<int64_t>& subnet_prefixes,
                                  const std::vector<int64_t>& interface_ids) {
-    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+    // remote_qpns has length qps_used = base_qps * num_ranks.
+    // Build QP-to-rank map only for the used QPs.
+    int qps_used = (int)remote_qpns.size();
+    int base_qps = qps_used / num_ranks;
+    std::vector<int> qp_to_rank(qps_used);
+    for (int r = 0; r < num_ranks; ++r) {
+        int qp_start = r * base_qps;
+        int qp_end = (r + 1) * base_qps;
+        for (int q = qp_start; q < qp_end; ++q)
+            qp_to_rank[q] = r;
+    }
+
+    for (int i = 0; i < qps_used; ++i) {
+        int remote_rank = qp_to_rank[i];
         ibv_gid remote_gid{};
-        remote_gid.global.subnet_prefix =
-            subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
-        remote_gid.global.interface_id =
-            interface_ids[i * num_ranks / MAX_QP_COUNT];
+        remote_gid.global.subnet_prefix = subnet_prefixes[remote_rank];
+        remote_gid.global.interface_id = interface_ids[remote_rank];
         ibv_ah_attr ah_attr = {};
         ah_attr.is_global = 1;
         ah_attr.grh.dgid = remote_gid;

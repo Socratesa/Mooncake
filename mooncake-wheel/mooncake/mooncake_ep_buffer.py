@@ -107,25 +107,23 @@ class Buffer:
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
+            # Each rank gets base_qps = MAX_QP_COUNT // group_size QPs.
+            # The last (MAX_QP_COUNT % group_size) QPs are unused (空置).
+            # This guarantees symmetric RC QP pairing for any group_size.
+            base_qps = ep.MAX_QP_COUNT // self.group_size
 
             if is_update:
                 self.runtime.update_local_qpns()
 
-            local_qpns = self.runtime.get_local_qpns()
-            local_qpns = list(
-                torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
-                        -1, all_to_all_size
-                    )
-                )
-            )
-            remote_qpns = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+            local_qpns = self.runtime.get_local_qpns()  # length = base_qps * group_size
+            local_qpns_t = torch.tensor(local_qpns, dtype=torch.int32, device="cuda")
+            local_qpns_list = list(torch.split(local_qpns_t, base_qps))
+            remote_qpns_list = [
+                torch.empty(base_qps, dtype=torch.int32, device="cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_to_all(remote_qpns, local_qpns, self.group)
-            remote_qpns = torch.cat(remote_qpns).tolist()
+            dist.all_to_all(remote_qpns_list, local_qpns_list, self.group)
+            remote_qpns = torch.cat(remote_qpns_list).tolist()
 
             if self.runtime.is_roce():
                 (subnet_prefix, interface_id) = self.runtime.get_gid()
@@ -154,20 +152,17 @@ class Buffer:
                     raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids
                 )
             else:
-                local_lids = self.runtime.get_local_lids()
-                local_lids = list(
-                    torch.unbind(
-                        torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
-                            -1, all_to_all_size
-                        )
-                    )
+                local_lids = self.runtime.get_local_lids()  # length = base_qps * group_size
+                local_lids_t = torch.tensor(
+                    local_lids, dtype=torch.int32, device="cuda"
                 )
-                remote_lids = [
-                    torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                local_lids_list = list(torch.split(local_lids_t, base_qps))
+                remote_lids_list = [
+                    torch.empty(base_qps, dtype=torch.int32, device="cuda")
                     for _ in range(self.group_size)
                 ]
-                dist.all_to_all(remote_lids, local_lids, self.group)
-                remote_lids = torch.cat(remote_lids).tolist()
+                dist.all_to_all(remote_lids_list, local_lids_list, self.group)
+                remote_lids = torch.cat(remote_lids_list).tolist()
 
                 self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
 
