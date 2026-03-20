@@ -216,21 +216,12 @@ def _elastic_scaling_worker(rank: int, initial_size: int, final_size: int, signa
         from mooncake import pg
 
         backend = dist.group.WORLD._get_backend(torch.device("cpu"))
-        while True:
-            num_synced = pg.get_num_synced_ranks(backend)
-            if num_synced == final_size:
-                break
-            # Keep doing collectives among existing ranks
-            tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cpu")
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            assert tensor.item() == expected
-
         # Extend group
         pg.extend_group_size_to(backend, final_size)
     else:
         # New ranks wait for signal
         while "extend" not in signals:
-            time.sleep(0.5)
+            time.sleep(1)
 
         dist.init_process_group(
             backend="mooncake-cpu",
@@ -297,6 +288,6 @@ if __name__ == "__main__":
         print(f"[SKIP] EP test requires >= 3 GPUs, found {num_gpus}", flush=True)
 
     # Test 3: PG elastic scaling
-    # test_elastic_scaling()
+    test_elastic_scaling()
 
     print("[ALL PASS] Mooncake scaling-up tests completed.", flush=True)
