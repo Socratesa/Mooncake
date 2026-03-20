@@ -66,12 +66,19 @@ class Buffer:
         from mooncake import ep, pg
 
         # Initialize the CPP runtime
-        self.rank = group.rank()
-        self.group_size = group.size()
         self.group = group
+        self.backend = self.group._get_backend(torch.device("cuda"))
+        self.rank = group.rank()
+        # After elastic scaling (extend_group_size_to), PyTorch's cached
+        # ProcessGroup.size() is stale (Backend::size_ is const).  The
+        # mooncake backend tracks the real dynamic size internally, so
+        # prefer that when available.  Other backends are unaffected.
+        if self.backend._get_backend_name() == "mooncake":
+            self.group_size = pg.get_group_size(self.backend)
+        else:
+            self.group_size = group.size()
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         # Get the index of the closest NIC
-        self.backend = self.group._get_backend(torch.device("cuda"))
         preferred_hca = pg.get_preferred_hca(
             self.backend, f"cuda:{torch.cuda.current_device()}"
         )

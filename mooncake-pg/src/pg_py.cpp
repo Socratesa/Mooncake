@@ -78,6 +78,12 @@ void recoverRanks(c10::intrusive_ptr<c10d::Backend> backend,
     mooncakeBackend->recoverRanks(ranks);
 }
 
+int getGroupSize(c10::intrusive_ptr<c10d::Backend> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return mooncakeBackend->getGroupSize();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
@@ -89,6 +95,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("extend_group_size_to", &extendGroupSizeTo);
     m.def("get_peer_state", &getPeerState);
     m.def("recover_ranks", &recoverRanks);
+    m.def("get_group_size", &getGroupSize);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(

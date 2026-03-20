@@ -45,7 +45,11 @@ class M2NBuffer:
                                  automatically via get_ep_buffer_size_hint.
         """
         self.rank = group.rank()
-        self.num_ranks = group.size()
+        # Derive num_ranks from the rank lists rather than group.size().
+        # group.size() may be stale after elastic scaling (e.g.
+        # extend_group_size_to updates the backend but not PyTorch's cached
+        # const Backend::size_).  The rank lists are always authoritative.
+        self.num_ranks = len(attention_ranks) + len(ffn_ranks)
 
         self.attention_ranks = sorted(attention_ranks)
         self.ffn_ranks = sorted(ffn_ranks)
@@ -373,7 +377,7 @@ class M2NBuffer:
             new_num_experts_per_rank: new expert slots per rank.
             num_ep_buffer_bytes: new buffer size. If None, auto-computed.
         """
-        new_num_ranks = new_group.size()
+        new_num_ranks = len(new_attention_ranks) + len(new_ffn_ranks)
         new_rank = new_group.rank()
 
         self.rank = new_rank
