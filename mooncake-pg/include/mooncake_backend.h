@@ -150,6 +150,8 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     void recoverRanks(const std::vector<int>& ranks);
 
+    int getGroupSize() const { return meta_->size; }
+
    private:
     static TransferEngine* engine_;
     std::shared_ptr<MooncakeWorker> worker_;

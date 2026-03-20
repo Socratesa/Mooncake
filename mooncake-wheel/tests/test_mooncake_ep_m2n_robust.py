@@ -8,8 +8,8 @@ Unlike test_mooncake_ep_m2n.py (which simulates failures via active_ranks
 masking), this file truly kills worker processes, spawns replacements with
 new PIDs and fresh GPU memory, and uses file-based barriers for sync.
 
-Three tests
------------
+Four tests
+----------
 T_Kill
   Real SIGKILL of rank 3 after Phase 1.  Surviving ranks run dispatch+combine
   with 2 s timeout.  Kernel sets active_ranks[3]=0 on timeout.  Re-route
@@ -18,17 +18,25 @@ T_Kill
 T_Recovery
   Kill rank 3.  Survivors detect crash (Phase 2).  Spawn NEW rank 3
   (different PID, new GPU memory, different RDMA virtual addresses).
-  Survivors call dist.destroy_process_group() [LOCAL op -- safe with dead rank].
-  All 4 form new group -> scale_up() -> verify full routing restored (Phase 3).
+  Survivors use pg.get_peer_state() + pg.recover_ranks() to re-integrate
+  rank 3 into the existing group (no destroy/reinit).  New rank 3 joins
+  with MooncakeBackendOptions(is_extension=True).  update_ep_member()
+  resyncs RDMA state.  Verify full routing restored (Phase 3).
 
 T_ScaleUp
   Baseline with 4 ranks (2 attn + 2 FFN).  Spawn ranks 4-7 while original
-  ranks wait at barrier.  All 8 form new group -> scale_up() -> verify
-  2a+6f topology with expert replication.
+  ranks use pg.extend_group_size_to() to grow the group.  New ranks join
+  with init_process_group at the expanded world_size.  scale_up() on
+  existing M2NBuffers.  Verify 2a+6f topology with expert replication.
+
+T_ScaleUp5
+  Baseline with 4 ranks (2 attn + 2 FFN).  Spawn rank 4 (single-rank
+  expansion).  Original ranks use pg.extend_group_size_to(5).  New rank
+  joins and gets a fresh M2NBuffer.  Verify 2a+3f topology.
 
 Usage
 -----
-  python test_mooncake_ep_m2n_robust.py [--tests kill recovery scaleup] [--gpus N]
+  python test_mooncake_ep_m2n_robust.py [--tests kill recovery scaleup scaleup5] [--gpus N]
 """
 
 import os
@@ -48,12 +56,13 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(__file__))
 
 from mooncake.mooncake_ep_m2n_buffer import M2NBuffer
+from mooncake import pg
 from ep_test_utils import calc_diff
-import mooncake.pg  # registers 'mooncake' backend
 
-T_KILL_PORT     = 29700
-T_RECOVERY_PORT = 29710   # epoch-0=29710, epoch-1=29711
-T_SCALEUP_PORT  = 29720   # epoch-0=29720, epoch-1=29721
+T_KILL_PORT      = 29700
+T_RECOVERY_PORT  = 29710
+T_SCALEUP_PORT   = 29720
+T_SCALEUP5_PORT  = 29730
 
 
 # ===========================================================================
@@ -100,7 +109,7 @@ class FileBarrier:
 def init_group(rank: int, world_ranks: List[int], port: int,
                timeout_sec: int = 60) -> dist.ProcessGroup:
     """
-    (Re-)initialise the default dist group for this epoch via TCPStore.
+    (Re-)initialise the default dist group via init_method.
     If a previous group exists it is destroyed first.
     destroy_process_group() is LOCAL (non-collective) -- safe with dead ranks.
     """
@@ -108,16 +117,12 @@ def init_group(rank: int, world_ranks: List[int], port: int,
         dist.destroy_process_group()
     world_size = len(world_ranks)
     local_rank = world_ranks.index(rank)
-    is_master  = (rank == world_ranks[0])
-    store = dist.TCPStore(
-        "127.0.0.1", port, world_size, is_master,
-        timeout=timedelta(seconds=timeout_sec),
-    )
     dist.init_process_group(
         backend="mooncake",
-        store=store,
+        init_method=f"tcp://127.0.0.1:{port}",
         rank=local_rank,
         world_size=world_size,
+        timeout=timedelta(seconds=timeout_sec),
     )
     return dist.group.WORLD
 
@@ -395,16 +400,16 @@ def worker_t_kill(rank: int, barrier_dir: str,
 
 def worker_t_recovery_survivor(rank: int, barrier_dir: str,
                                 result_q: mp.Queue,
-                                port_e0: int, port_e1: int):
+                                port: int):
     """
     Survivor workers (ranks 0, 1, 2) across all three T_Recovery phases.
 
     Phase 1   All 4 ranks baseline.
     [SIGKILL] Coordinator kills rank 3 after 'phase1'.
     Phase 2   Survivors timeout, detect crash, re-route.
-    Phase 3   Survivors destroy old group (LOCAL op).
-              Wait for new rank-3 signal.
-              All 4 form epoch-1 group -> scale_up() -> verify recovery.
+    Phase 3   Survivors poll pg.get_peer_state() for new rank-3 process.
+              Once connected, call pg.recover_ranks() to re-integrate rank 3.
+              All 4 call update_ep_member() to resync RDMA state -> verify.
     """
     torch.cuda.set_device(rank)
     bar = FileBarrier(Path(barrier_dir) / "t_recovery")
@@ -419,13 +424,13 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     ALL         = [0, 1, 2, 3]
     SURVIVORS   = [0, 1, 2]
 
-    # Epoch 0
-    group0   = init_group(rank, ALL, port_e0)
+    # Single group for the entire test lifetime
+    group    = init_group(rank, ALL, port)
     phy2log  = build_phy2log(4, FFN, NUM_LOGICAL)
     epr      = len(phy2log) // 4
     remapper = ExpertRemapper(phy2log, NUM_LOGICAL)
     active   = make_active_ranks(4)
-    m2n      = M2NBuffer(group0, ATTN, FFN, epr, MAX_DISP, HIDDEN)
+    m2n      = M2NBuffer(group, ATTN, FFN, epr, MAX_DISP, HIDDEN)
     role     = m2n.role
 
     x = (make_tokens(NUM_TOKENS, HIDDEN, rank)
@@ -456,24 +461,29 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     bar.arrive_and_wait("phase2_done", rank, SURVIVORS)
     log(rank, role, "T_Recovery Phase 2 PASSED")
 
-    # Phase 3 -- destroy old group, form new group with new rank 3
-    log(rank, role, "T_Recovery Phase 3: destroy epoch-0 group (LOCAL op)")
-    dist.destroy_process_group()
-
-    log(rank, role, "T_Recovery Phase 3: waiting for new rank-3 process...")
+    # Phase 3 -- recover rank 3 in-place using pg elastic APIs
+    log(rank, role, "T_Recovery Phase 3: waiting for new rank-3 process to connect...")
     bar.wait_for("new_r3_ready", [3])
 
-    # All 4 synchronise before forming the new group so rank-0 (TCPStore master)
-    # is guaranteed to be at its store before rank-3 tries to connect.
-    bar.arrive_and_wait("phase3_form_group", rank, ALL)
-
-    log(rank, role, "T_Recovery Phase 3: forming epoch-1 group")
-    group1 = init_group(rank, ALL, port_e1)
-
-    log(rank, role, "T_Recovery Phase 3: scale_up() -- new rank-3 has fresh RDMA addrs")
-    m2n.scale_up(group1, ATTN, FFN, epr)
-
+    # Poll until the new rank-3 process has connected to the PG backend
+    backend = group._get_backend(torch.device("cuda"))
+    while True:
+        (peer_state,) = pg.get_peer_state(backend, [3])
+        if peer_state:
+            break
+        time.sleep(0.1)
+    log(rank, role, "T_Recovery Phase 3: new rank 3 connected, calling recover_ranks()")
+    pg.recover_ranks(backend, [3])
     active[3] = 1
+
+    # Synchronize with new rank 3 BEFORE the collective Buffer.connect().
+    # New rank 3 creates M2NBuffer (-> Buffer.connect()) while survivors
+    # call scale_up() (-> new Buffer -> Buffer.connect()).  Both sides enter
+    # connect(is_update=False) so their all_gather / all_to_all align.
+    bar.arrive_and_wait("phase3_resync", rank, ALL)
+    log(rank, role, "T_Recovery Phase 3: update_ep_member() -- rebuild Buffer with new rank 3")
+    m2n.update_ep_member()
+
     if role == "attention":
         print_routing_stats(rank, role, tidx_phy, 4, epr, "phase3 full routing")
     cx3, _, _ = run_dispatch_combine(m2n, active, x, tidx_phy, tw, NUM_TOPK)
@@ -485,7 +495,7 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     log(rank, role, "T_Recovery PASSED")
 
 
-def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port_e0: int):
+def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port: int):
     """
     Original rank 3 -- participates in Phase 1 then waits for SIGKILL.
     Never reaches Phase 2.
@@ -503,12 +513,12 @@ def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port_e0: int):
     FFN         = [2, 3]
     ALL         = [0, 1, 2, 3]
 
-    group0   = init_group(rank, ALL, port_e0)
+    group    = init_group(rank, ALL, port)
     phy2log  = build_phy2log(4, FFN, NUM_LOGICAL)
     epr      = len(phy2log) // 4
     remapper = ExpertRemapper(phy2log, NUM_LOGICAL)
     active   = make_active_ranks(4)
-    m2n      = M2NBuffer(group0, ATTN, FFN, epr, MAX_DISP, HIDDEN)
+    m2n      = M2NBuffer(group, ATTN, FFN, epr, MAX_DISP, HIDDEN)
     role     = m2n.role  # "ffn"
 
     x = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -524,14 +534,14 @@ def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port_e0: int):
 
 
 def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
-                                 result_q: mp.Queue, port_e1: int):
+                                 result_q: mp.Queue, port: int):
     """
     NEW rank-3 process (Phase 3 only).
 
     This process has a DIFFERENT PID from the killed rank 3.
-    Its CUDA allocations use new virtual addresses.  scale_up() on survivors
-    exchanges these addresses via Buffer.connect(), proving RDMA works with
-    freshly allocated memory.
+    Its CUDA allocations use new virtual addresses.  It joins the existing
+    group using MooncakeBackendOptions(is_extension=True), then participates
+    in update_ep_member() to exchange fresh RDMA addresses with all peers.
     """
     assert rank == 3
     torch.cuda.set_device(rank)
@@ -550,24 +560,37 @@ def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
     log(rank, role,
         f"T_Recovery Phase 3 (NEW rank 3): PID={os.getpid()} -- fresh GPU memory")
 
-    # Signal readiness immediately so survivors can proceed to Phase 3
+    # Signal readiness so survivors can start polling get_peer_state
     bar.arrive("new_r3_ready", rank)
 
-    # Wait until survivors finished Phase 2 (so they are at destroy_group step)
+    # Wait until survivors finished Phase 2
     bar.wait_for("phase2_done", [0, 1, 2])
 
-    bar.arrive_and_wait("phase3_form_group", rank, ALL)
-
-    log(rank, role, "T_Recovery Phase 3: forming epoch-1 group")
-    group1 = init_group(rank, ALL, port_e1)
+    # Join the existing group as a recovered rank using MooncakeBackendOptions
+    log(rank, role, "T_Recovery Phase 3: joining existing group with is_extension=True")
+    dist.init_process_group(
+        backend="mooncake",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=4,
+        pg_options=pg.MooncakeBackendOptions(
+            torch.ones(4, dtype=torch.int32, device="cuda"),
+            True,  # is_extension=True for recovered rank
+        ),
+    )
+    group = dist.group.WORLD
 
     phy2log  = build_phy2log(4, FFN, NUM_LOGICAL)
     epr      = len(phy2log) // 4
     remapper = ExpertRemapper(phy2log, NUM_LOGICAL)
     active   = make_active_ranks(4)
 
-    log(rank, role, "T_Recovery Phase 3: NEW M2NBuffer (Buffer.connect exchanges new RDMA addrs)")
-    m2n = M2NBuffer(group1, ATTN, FFN, epr, MAX_DISP, HIDDEN)
+    # Synchronize with survivors BEFORE the collective Buffer.connect().
+    # Survivors call scale_up() (-> new Buffer -> connect()) while we create
+    # M2NBuffer (-> Buffer.__init__ -> connect()).  Both enter connect(is_update=False).
+    bar.arrive_and_wait("phase3_resync", rank, ALL)
+    log(rank, role, "T_Recovery Phase 3: creating M2NBuffer (connect() aligns with survivors' update_ep_member)")
+    m2n = M2NBuffer(group, ATTN, FFN, epr, MAX_DISP, HIDDEN)
 
     x = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda")
     tidx_log, tw = make_routing(NUM_TOKENS, NUM_LOGICAL, NUM_TOPK,
@@ -587,14 +610,15 @@ def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
 
 def worker_t_scaleup_orig(rank: int, barrier_dir: str,
                            result_q: mp.Queue,
-                           port_e0: int, port_e1: int):
+                           port: int):
     """
     Original ranks 0-3 across both T_ScaleUp phases.
 
     Phase 1  2a+2f baseline (4 ranks).
     [spawn]  Coordinator spawns ranks 4-7 after 'phase1'.
-    Phase 2  Destroy Phase-1 group (local).  Wait at 'phase2_ready' for all 8.
-             Form epoch-1 group.  scale_up() to 2a+6f.  Verify.
+    Phase 2  Original ranks call pg.extend_group_size_to(8) to grow the
+             existing group.  Wait at 'phase2_ready' for all 8 to be
+             connected.  scale_up() to 2a+6f.  Verify.
     """
     torch.cuda.set_device(rank)
     bar = FileBarrier(Path(barrier_dir) / "t_scaleup")
@@ -611,13 +635,13 @@ def worker_t_scaleup_orig(rank: int, barrier_dir: str,
     P2_FFN      = [2, 3, 4, 5, 6, 7]
     P2_ALL      = list(range(8))
 
-    # Epoch 0
-    group0      = init_group(rank, P1_ALL, port_e0)
+    # Single group for the entire test
+    group       = init_group(rank, P1_ALL, port)
     phy2log_p1  = build_phy2log(4, P1_FFN, NUM_LOGICAL)
     epr_p1      = len(phy2log_p1) // 4
     remapper_p1 = ExpertRemapper(phy2log_p1, NUM_LOGICAL)
     active_p1   = make_active_ranks(4)
-    m2n         = M2NBuffer(group0, P1_ATTN, P1_FFN, epr_p1, MAX_DISP, HIDDEN)
+    m2n         = M2NBuffer(group, P1_ATTN, P1_FFN, epr_p1, MAX_DISP, HIDDEN)
     role        = m2n.role
 
     x = (make_tokens(NUM_TOKENS, HIDDEN, rank)
@@ -638,16 +662,14 @@ def worker_t_scaleup_orig(rank: int, barrier_dir: str,
     bar.arrive_and_wait("phase1", rank, P1_ALL)
     log(rank, role, "T_ScaleUp Phase 1 PASSED")
 
-    # Destroy Phase-1 group (LOCAL op) and wait for all 8 at phase2_ready
-    log(rank, role, "T_ScaleUp: destroying Phase-1 group (local)")
-    dist.destroy_process_group()
+    # Extend group from 4 to 8 ranks (non-blocking)
+    backend = group._get_backend(torch.device("cuda"))
+    log(rank, role, "T_ScaleUp: extending group from 4 to 8 via pg.extend_group_size_to()")
+    pg.extend_group_size_to(backend, 8)
 
     bar.arrive_and_wait("phase2_ready", rank, P2_ALL)
 
-    # Epoch 1
-    log(rank, role, "T_ScaleUp Phase 2: forming 8-rank group")
-    group1 = init_group(rank, P2_ALL, port_e1)
-
+    # Phase 2 -- scale_up with 8-rank topology
     ffn_assignment = {
         2: list(range(0,  64)),  3: list(range(64, 128)),
         4: list(range(0,  64)),  5: list(range(0,  64)),
@@ -659,7 +681,7 @@ def worker_t_scaleup_orig(rank: int, barrier_dir: str,
     active_p2   = make_active_ranks(8)
 
     log(rank, role, "T_ScaleUp Phase 2: scale_up() with 8-rank group")
-    m2n.scale_up(group1, P2_ATTN, P2_FFN, epr_p2)
+    m2n.scale_up(group, P2_ATTN, P2_FFN, epr_p2)
 
     tidx_log_p2, tw_p2 = make_routing(NUM_TOKENS, NUM_LOGICAL, NUM_TOPK,
                                        seed=40 + rank)
@@ -678,10 +700,11 @@ def worker_t_scaleup_orig(rank: int, barrier_dir: str,
 
 
 def worker_t_scaleup_new(rank: int, barrier_dir: str,
-                          result_q: mp.Queue, port_e1: int):
+                          result_q: mp.Queue, port: int):
     """
     New ranks 4-7 in T_ScaleUp Phase 2.
     Spawned while original ranks wait at 'phase2_ready' barrier.
+    Joins the expanded group with init_process_group at world_size=8.
     """
     assert 4 <= rank <= 7
     torch.cuda.set_device(rank)
@@ -699,9 +722,10 @@ def worker_t_scaleup_new(rank: int, barrier_dir: str,
     role = "ffn"
     log(rank, role, f"T_ScaleUp Phase 2: new rank {rank}  PID={os.getpid()}")
 
-    bar.arrive_and_wait("phase2_ready", rank, P2_ALL)
+    # Join the extended group at the expanded world_size
+    group = init_group(rank, P2_ALL, port)
 
-    group1 = init_group(rank, P2_ALL, port_e1)
+    bar.arrive_and_wait("phase2_ready", rank, P2_ALL)
 
     ffn_assignment = {
         2: list(range(0,  64)),  3: list(range(64, 128)),
@@ -713,7 +737,7 @@ def worker_t_scaleup_new(rank: int, barrier_dir: str,
     remapper_p2 = ExpertRemapper(phy2log_p2, NUM_LOGICAL)
     active_p2   = make_active_ranks(8)
 
-    m2n = M2NBuffer(group1, P2_ATTN, P2_FFN, epr_p2, MAX_DISP, HIDDEN)
+    m2n = M2NBuffer(group, P2_ATTN, P2_FFN, epr_p2, MAX_DISP, HIDDEN)
     x   = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda")
     tidx_log, tw = make_routing(NUM_TOKENS, NUM_LOGICAL, NUM_TOPK,
                                 seed=40 + rank)
@@ -727,6 +751,150 @@ def worker_t_scaleup_new(rank: int, barrier_dir: str,
 
     result_q.put({"rank": rank, "test": "T_ScaleUp", "status": "PASSED"})
     log(rank, role, "T_ScaleUp PASSED")
+
+
+# ===========================================================================
+# T_ScaleUp5 (single-rank expansion 4 -> 5)
+# ===========================================================================
+
+def worker_t_scaleup5_orig(rank: int, barrier_dir: str,
+                            result_q: mp.Queue, port: int):
+    """
+    Original ranks 0-3 across both T_ScaleUp5 phases.
+
+    Phase 1  2a+2f baseline (4 ranks).
+    [spawn]  Coordinator spawns rank 4 after 'phase1'.
+    Phase 2  Original ranks call pg.extend_group_size_to(5).
+             Wait at 'phase2_ready' for all 5.  scale_up() to 2a+3f.  Verify.
+    """
+    torch.cuda.set_device(rank)
+    bar = FileBarrier(Path(barrier_dir) / "t_scaleup5")
+
+    NUM_LOGICAL = 128
+    HIDDEN      = 2560
+    NUM_TOPK    = 8
+    NUM_TOKENS  = 128
+    MAX_DISP    = 128
+    P1_ATTN     = [0, 1]
+    P1_FFN      = [2, 3]
+    P1_ALL      = [0, 1, 2, 3]
+    P2_ATTN     = [0, 1]
+    P2_FFN      = [2, 3, 4]
+    P2_ALL      = list(range(5))
+
+    group       = init_group(rank, P1_ALL, port)
+    phy2log_p1  = build_phy2log(4, P1_FFN, NUM_LOGICAL)
+    epr_p1      = len(phy2log_p1) // 4
+    remapper_p1 = ExpertRemapper(phy2log_p1, NUM_LOGICAL)
+    active_p1   = make_active_ranks(4)
+    m2n         = M2NBuffer(group, P1_ATTN, P1_FFN, epr_p1, MAX_DISP, HIDDEN)
+    role        = m2n.role
+
+    x = (make_tokens(NUM_TOKENS, HIDDEN, rank)
+         if role == "attention"
+         else torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda"))
+    tidx_log_p1, tw_p1 = make_routing(NUM_TOKENS, NUM_LOGICAL, NUM_TOPK,
+                                       seed=50 + rank)
+    tidx_phy_p1 = remapper_p1.remap(tidx_log_p1)
+
+    # Phase 1
+    log(rank, role, "T_ScaleUp5 Phase 1 (4 ranks, 2a+2f): baseline")
+    if role == "attention":
+        print_routing_stats(rank, role, tidx_phy_p1, 4, epr_p1, "phase1")
+    cx_p1, _, _ = run_dispatch_combine(
+        m2n, active_p1, x, tidx_phy_p1, tw_p1, NUM_TOPK)
+    verify_correctness(x, tidx_phy_p1, tw_p1, cx_p1,
+                       "T_ScaleUp5 Phase 1", rank, role)
+    bar.arrive_and_wait("phase1", rank, P1_ALL)
+    log(rank, role, "T_ScaleUp5 Phase 1 PASSED")
+
+    # Extend group from 4 to 5 ranks (non-blocking)
+    backend = group._get_backend(torch.device("cuda"))
+    log(rank, role, "T_ScaleUp5: extending group from 4 to 5 via pg.extend_group_size_to()")
+    pg.extend_group_size_to(backend, 5)
+
+    bar.arrive_and_wait("phase2_ready", rank, P2_ALL)
+
+    # Phase 2 -- scale_up with 5-rank topology
+    ffn_assignment = {
+        2: list(range(0,  64)),
+        3: list(range(64, 128)),
+        4: list(range(0,  64)),  # replica of rank 2
+    }
+    phy2log_p2  = build_phy2log(5, P2_FFN, NUM_LOGICAL, ffn_assignment)
+    epr_p2      = len(phy2log_p2) // 5
+    remapper_p2 = ExpertRemapper(phy2log_p2, NUM_LOGICAL)
+    active_p2   = make_active_ranks(5)
+
+    log(rank, role, "T_ScaleUp5 Phase 2: scale_up() with 5-rank group")
+    m2n.scale_up(group, P2_ATTN, P2_FFN, epr_p2)
+
+    tidx_log_p2, tw_p2 = make_routing(NUM_TOKENS, NUM_LOGICAL, NUM_TOPK,
+                                       seed=60 + rank)
+    tidx_phy_p2 = remapper_p2.remap(tidx_log_p2)
+    if m2n.role == "attention":
+        print_routing_stats(rank, m2n.role, tidx_phy_p2, 5, epr_p2,
+                            "phase2 (2a+3f)")
+    cx_p2, _, _ = run_dispatch_combine(
+        m2n, active_p2, x, tidx_phy_p2, tw_p2, NUM_TOPK)
+    verify_correctness(x, tidx_phy_p2, tw_p2, cx_p2,
+                       "T_ScaleUp5 Phase 2", rank, m2n.role)
+    bar.arrive_and_wait("phase2_done", rank, P2_ALL)
+
+    result_q.put({"rank": rank, "test": "T_ScaleUp5", "status": "PASSED"})
+    log(rank, m2n.role, "T_ScaleUp5 PASSED")
+
+
+def worker_t_scaleup5_new(rank: int, barrier_dir: str,
+                           result_q: mp.Queue, port: int):
+    """
+    New rank 4 in T_ScaleUp5 Phase 2.
+    Spawned while original ranks wait at 'phase2_ready' barrier.
+    """
+    assert rank == 4
+    torch.cuda.set_device(rank)
+    bar = FileBarrier(Path(barrier_dir) / "t_scaleup5")
+
+    NUM_LOGICAL = 128
+    HIDDEN      = 2560
+    NUM_TOPK    = 8
+    NUM_TOKENS  = 128
+    MAX_DISP    = 128
+    P2_ATTN     = [0, 1]
+    P2_FFN      = [2, 3, 4]
+    P2_ALL      = list(range(5))
+
+    role = "ffn"
+    log(rank, role, f"T_ScaleUp5 Phase 2: new rank {rank}  PID={os.getpid()}")
+
+    group = init_group(rank, P2_ALL, port)
+
+    bar.arrive_and_wait("phase2_ready", rank, P2_ALL)
+
+    ffn_assignment = {
+        2: list(range(0,  64)),
+        3: list(range(64, 128)),
+        4: list(range(0,  64)),  # replica of rank 2
+    }
+    phy2log_p2  = build_phy2log(5, P2_FFN, NUM_LOGICAL, ffn_assignment)
+    epr_p2      = len(phy2log_p2) // 5
+    remapper_p2 = ExpertRemapper(phy2log_p2, NUM_LOGICAL)
+    active_p2   = make_active_ranks(5)
+
+    m2n = M2NBuffer(group, P2_ATTN, P2_FFN, epr_p2, MAX_DISP, HIDDEN)
+    x   = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    tidx_log, tw = make_routing(NUM_TOKENS, NUM_LOGICAL, NUM_TOPK,
+                                seed=60 + rank)
+    tidx_phy = remapper_p2.remap(tidx_log)
+
+    _, _, prc = run_dispatch_combine(m2n, active_p2, x, tidx_phy, tw, NUM_TOPK)
+    log(rank, role,
+        f"T_ScaleUp5 Phase 2: received {int(prc.sum())} tokens  "
+        f"counts={prc.tolist()}")
+    bar.arrive_and_wait("phase2_done", rank, P2_ALL)
+
+    result_q.put({"rank": rank, "test": "T_ScaleUp5", "status": "PASSED"})
+    log(rank, role, "T_ScaleUp5 PASSED")
 
 
 # ===========================================================================
@@ -807,15 +975,15 @@ def run_t_kill(coord: Coordinator) -> bool:
 
 def run_t_recovery(coord: Coordinator) -> bool:
     print("\n" + "=" * 70, flush=True)
-    print("T_Recovery: SIGKILL rank 3 -> new process -> scale_up()", flush=True)
+    print("T_Recovery: SIGKILL rank 3 -> new process -> recover_ranks + update_ep_member", flush=True)
     print("=" * 70, flush=True)
     bar = coord.bar("t_recovery")
-    pe0, pe1 = T_RECOVERY_PORT, T_RECOVERY_PORT + 1
+    port = T_RECOVERY_PORT
     for r in range(3):
         coord.spawn(r, worker_t_recovery_survivor,
-                    r, str(coord.barrier_dir), coord.result_q, pe0, pe1)
+                    r, str(coord.barrier_dir), coord.result_q, port)
     coord.spawn(3, worker_t_recovery_rank3_orig,
-                3, str(coord.barrier_dir), pe0)
+                3, str(coord.barrier_dir), port)
     bar.wait_for("phase1", [0, 1, 2, 3], timeout=180)
     print("[Coord] T_Recovery Phase 1 done -- SIGKILL rank 3", flush=True)
     coord.kill(3)
@@ -823,7 +991,7 @@ def run_t_recovery(coord: Coordinator) -> bool:
     bar.wait_for("phase2_done", [0, 1, 2], timeout=180)
     print("[Coord] T_Recovery Phase 2 done -- spawning NEW rank 3", flush=True)
     coord.spawn(3, worker_t_recovery_rank3_new,
-                3, str(coord.barrier_dir), coord.result_q, pe1)
+                3, str(coord.barrier_dir), coord.result_q, port)
     passed = coord.collect([0, 1, 2, 3], timeout=180)
     print("=" * 70, flush=True)
     print(f"T_Recovery: {'PASSED' if passed else 'FAILED'}", flush=True)
@@ -833,21 +1001,41 @@ def run_t_recovery(coord: Coordinator) -> bool:
 
 def run_t_scaleup(coord: Coordinator) -> bool:
     print("\n" + "=" * 70, flush=True)
-    print("T_ScaleUp: dynamic rank expansion 4 -> 8", flush=True)
+    print("T_ScaleUp: dynamic rank expansion 4 -> 8 via extend_group_size_to", flush=True)
     print("=" * 70, flush=True)
     bar = coord.bar("t_scaleup")
-    pe0, pe1 = T_SCALEUP_PORT, T_SCALEUP_PORT + 1
+    port = T_SCALEUP_PORT
     for r in range(4):
         coord.spawn(r, worker_t_scaleup_orig,
-                    r, str(coord.barrier_dir), coord.result_q, pe0, pe1)
+                    r, str(coord.barrier_dir), coord.result_q, port)
     bar.wait_for("phase1", [0, 1, 2, 3], timeout=180)
     print("[Coord] T_ScaleUp Phase 1 done -- spawning ranks 4-7", flush=True)
     for r in range(4, 8):
         coord.spawn(r, worker_t_scaleup_new,
-                    r, str(coord.barrier_dir), coord.result_q, pe1)
+                    r, str(coord.barrier_dir), coord.result_q, port)
     passed = coord.collect(list(range(8)), timeout=240)
     print("=" * 70, flush=True)
     print(f"T_ScaleUp: {'PASSED' if passed else 'FAILED'}", flush=True)
+    print("=" * 70, flush=True)
+    return passed
+
+
+def run_t_scaleup5(coord: Coordinator) -> bool:
+    print("\n" + "=" * 70, flush=True)
+    print("T_ScaleUp5: single-rank expansion 4 -> 5 via extend_group_size_to", flush=True)
+    print("=" * 70, flush=True)
+    bar = coord.bar("t_scaleup5")
+    port = T_SCALEUP5_PORT
+    for r in range(4):
+        coord.spawn(r, worker_t_scaleup5_orig,
+                    r, str(coord.barrier_dir), coord.result_q, port)
+    bar.wait_for("phase1", [0, 1, 2, 3], timeout=180)
+    print("[Coord] T_ScaleUp5 Phase 1 done -- spawning rank 4", flush=True)
+    coord.spawn(4, worker_t_scaleup5_new,
+                4, str(coord.barrier_dir), coord.result_q, port)
+    passed = coord.collect(list(range(5)), timeout=180)
+    print("=" * 70, flush=True)
+    print(f"T_ScaleUp5: {'PASSED' if passed else 'FAILED'}", flush=True)
     print("=" * 70, flush=True)
     return passed
 
@@ -861,10 +1049,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="M2N robust fault-tolerance tests (real SIGKILL + restart)")
     parser.add_argument("--tests", nargs="+",
-                        default=["kill", "recovery", "scaleup"],
-                        choices=["kill", "recovery", "scaleup"])
-    parser.add_argument("--gpus", type=int, default=4,
-                        help="Number of GPUs (>=8 required for T_ScaleUp)")
+                        default=["kill", "recovery", "scaleup", "scaleup5"],
+                        choices=["kill", "recovery", "scaleup", "scaleup5"])
+    parser.add_argument("--gpus", type=int, default=8,
+                        help="Number of GPUs (>=5 for T_ScaleUp5, >=8 for T_ScaleUp)")
     args = parser.parse_args()
 
     mp.set_start_method("spawn", force=True)
@@ -894,6 +1082,17 @@ if __name__ == "__main__":
             print(f"[Coord] T_ScaleUp  barrier_dir={coord.barrier_dir}", flush=True)
             try:
                 results["T_ScaleUp"] = run_t_scaleup(coord)
+            finally:
+                coord.cleanup()
+
+    if "scaleup5" in args.tests:
+        if args.gpus < 5:
+            print("[Coord] T_ScaleUp5 requires >=5 GPUs -- skipping", flush=True)
+        else:
+            coord = Coordinator()
+            print(f"[Coord] T_ScaleUp5  barrier_dir={coord.barrier_dir}", flush=True)
+            try:
+                results["T_ScaleUp5"] = run_t_scaleup5(coord)
             finally:
                 coord.cleanup()
 
