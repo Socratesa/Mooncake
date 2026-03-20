@@ -22,9 +22,11 @@ import torch
 import torch.distributed as dist
 from typing import Dict, List, Optional, Tuple
 
+from mooncake import pg
 from mooncake.mooncake_ep_m2n_buffer import M2NBuffer
 from ep_test_utils import init_dist, calc_diff, per_token_cast_back
 
+pg.set_device_filter(["mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_7", "mlx5_8"])
 
 def nccl_barrier(group):
     """NCCL-compatible barrier using a dummy all_reduce."""
@@ -642,6 +644,10 @@ def test_scaling_up_recovery(rank: int, num_ranks: int, group: dist.ProcessGroup
         (including resetting rank 3's diverged buffer index), then active_ranks[3]=1
         is restored. Full numeric correctness is verified, confirming update_ep_member
         truly re-establishes communication with rank 3.
+
+    No nccl_barrier is used between phases.  update_ep_member() is itself a
+    collective (dist.all_gather + dist.all_to_all inside connect()) and serves
+    as the cross-rank synchronisation point before Phase 3.
     """
     num_logical_experts = 128
     hidden = 2560
@@ -669,7 +675,7 @@ def test_scaling_up_recovery(rank: int, num_ranks: int, group: dist.ProcessGroup
     topk_idx_logical, topk_weights = make_routing(num_tokens, num_logical_experts, num_topk, seed=200 + rank)
     topk_idx_physical = remapper.remap(topk_idx_logical)
 
-    # Phase 1: normal baseline
+    # ── Phase 1: normal baseline ─────────────────────────────────────
     log(rank, role, f"---- Phase 1: all ranks active, active_ranks={active_ranks.tolist()} ----")
     if role == "attention":
         print_routing_stats(rank, role, topk_idx_physical, num_ranks, num_experts_per_rank, "phase1 routing")
@@ -678,25 +684,19 @@ def test_scaling_up_recovery(rank: int, num_ranks: int, group: dist.ProcessGroup
     )
     if role == "attention":
         verify_combine_correctness(x, topk_idx_physical, topk_weights, combined_x, "Test 3a Phase 1 (normal)", rank, role)
-    nccl_barrier(group)
 
-    # Phase 2: rank 3 genuinely absent — does not call dispatch/combine at all.
-    # Inference engine pre-sets active_ranks[3]=0 and masks topk_idx so that:
-    #   (a) no tokens are dispatched to rank 3 experts (topk_idx_masked)
-    #   (b) the combine kernel exits rank-3 spin-wait immediately without timeout
-    # The remaining ranks produce fully correct results with no timeout penalty.
+    # ── Phase 2: rank 3 absent ───────────────────────────────────────
+    # Inference engine pre-sets active_ranks[3]=0 and masks topk_idx.
+    # No barrier needed — rank 3 skips dispatch/combine entirely while
+    # the other ranks proceed.  RDMA fast-path dispatch/combine does not
+    # use any PG collectives, so there is no collective-count mismatch.
     active_ranks[3] = 0
     topk_idx_masked = mask_inactive_experts(topk_idx_physical, active_ranks, num_experts_per_rank)
-    num_masked = (topk_idx_masked == -1).sum().item() - (topk_idx_physical == -1).sum().item()
-    log(rank, role,
-        f"---- Phase 2: rank 3 offline — {num_masked} topk entries masked, "
-        f"active_ranks={active_ranks.tolist()} ----")
+
+    log(rank, role, f"---- Phase 2: rank 3 offline, active_ranks={active_ranks.tolist()} ----")
 
     if rank == 3:
-        # Rank 3 completely absent: buffer_idx intentionally NOT advanced here.
-        # update_ep_member() in Phase 3 must resync this diverged state.
-        log(rank, role, "Phase 2: rank 3 offline — skipping dispatch/combine entirely")
-        torch.cuda.synchronize()
+        log(rank, role, "Phase 2: skipping dispatch/combine (simulating offline)")
     else:
         if role == "attention":
             print_routing_stats(rank, role, topk_idx_masked, num_ranks, num_experts_per_rank, "phase2 routing (masked)")
@@ -704,18 +704,17 @@ def test_scaling_up_recovery(rank: int, num_ranks: int, group: dist.ProcessGroup
             m2n, active_ranks, x, topk_idx_masked, topk_weights, num_topk, use_fp8=False,
         )
         if role == "attention":
-            # Full numeric verify: all tokens are masked away from rank 3,
-            # so combined_x is cleanly rank-2-only, diff must be tight.
             verify_combine_correctness(x, topk_idx_masked, topk_weights, combined_x2,
                                        "Test 3a Phase 2 (rank 3 absent)", rank, role)
-    nccl_barrier(group)
 
-    # Phase 3: recover — update_ep_member resyncs RDMA state (including rank 3's
-    # diverged buffer_idx), then re-enable rank 3 with original routing.
-    log(rank, role, f"---- Phase 3: recovery — update_ep_member + active_ranks[3] = 1 ----")
-    m2n.update_ep_member()
+    # ── Phase 3: recovery via update_ep_member ───────────────────────
+    # update_ep_member() is a collective (all_gather + all_to_all inside
+    # connect()).  It re-exchanges RDMA metadata and resets rank 3's
+    # diverged buffer_idx.  This is the only cross-rank sync needed.
+    log(rank, role, "---- Phase 3: recovery ----")
     active_ranks[3] = 1
-    log(rank, role, f"active_ranks restored to: {active_ranks.tolist()}")
+    m2n.update_ep_member()
+    log(rank, role, f"update_ep_member done, active_ranks={active_ranks.tolist()}")
 
     if role == "attention":
         print_routing_stats(rank, role, topk_idx_physical, num_ranks, num_experts_per_rank, "phase3 routing (restored)")
@@ -726,7 +725,6 @@ def test_scaling_up_recovery(rank: int, num_ranks: int, group: dist.ProcessGroup
         verify_combine_correctness(x, topk_idx_physical, topk_weights, combined_x3,
                                    "Test 3a Phase 3 (recovered)", rank, role)
 
-    nccl_barrier(group)
     if rank == 0:
         print("=" * 60)
         print("Test 3a: Scaling Up -- Recovery -- PASSED")

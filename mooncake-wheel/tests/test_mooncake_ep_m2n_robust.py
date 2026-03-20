@@ -16,10 +16,13 @@ T_Kill
   with masked topk_idx.  Verify numeric correctness.
 
 T_Recovery
-  Kill rank 3.  Survivors detect crash (Phase 2).  Spawn NEW rank 3
-  (different PID, new GPU memory, different RDMA virtual addresses).
-  Survivors call dist.destroy_process_group() [LOCAL op -- safe with dead rank].
-  All 4 form new group -> scale_up() -> verify full routing restored (Phase 3).
+  Kill rank 3.  Survivors detect crash via timeout (Phase 2).  Spawn NEW
+  rank 3 (different PID, new GPU memory, different RDMA virtual addresses).
+  New rank 3 joins the SAME TCPStore via init_process_group(isExtension=True).
+  Survivors poll pg.get_peer_state() -> pg.recover_ranks() -> all ranks call
+  m2n.update_ep_member() (new rank) / connect(is_update=True) (survivors) to
+  re-exchange RDMA metadata -> verify full routing restored (Phase 3).
+  NO destroy_process_group -- pure in-place recovery.
 
 T_ScaleUp
   Baseline with 4 ranks (2 attn + 2 FFN).  Spawn ranks 4-7 while original
@@ -52,7 +55,7 @@ from ep_test_utils import calc_diff
 import mooncake.pg  # registers 'mooncake' backend
 
 T_KILL_PORT     = 29700
-T_RECOVERY_PORT = 29710   # epoch-0=29710, epoch-1=29711
+T_RECOVERY_PORT = 29710   # single store survives across all phases
 T_SCALEUP_PORT  = 29720   # epoch-0=29720, epoch-1=29721
 
 
@@ -394,20 +397,22 @@ def worker_t_kill(rank: int, barrier_dir: str,
 # ===========================================================================
 
 def worker_t_recovery_survivor(rank: int, barrier_dir: str,
-                                result_q: mp.Queue,
-                                port_e0: int, port_e1: int):
+                                result_q: mp.Queue, port: int):
     """
     Survivor workers (ranks 0, 1, 2) across all three T_Recovery phases.
 
     Phase 1   All 4 ranks baseline.
     [SIGKILL] Coordinator kills rank 3 after 'phase1'.
     Phase 2   Survivors timeout, detect crash, re-route.
-    Phase 3   Survivors destroy old group (LOCAL op).
-              Wait for new rank-3 signal.
-              All 4 form epoch-1 group -> scale_up() -> verify recovery.
+    Phase 3   NO destroy_process_group.  Survivors keep the existing group.
+              New rank 3 joins the SAME TCPStore with isExtension=True.
+              Survivors poll get_peer_state() -> recover_ranks().
+              Then update_ep_member() (collective) re-exchanges RDMA metadata.
+              Verify full routing restored.
     """
     torch.cuda.set_device(rank)
     bar = FileBarrier(Path(barrier_dir) / "t_recovery")
+    import mooncake.pg as mpg   # for get_peer_state / recover_ranks
 
     NUM_LOGICAL = 128
     HIDDEN      = 2560
@@ -419,13 +424,12 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     ALL         = [0, 1, 2, 3]
     SURVIVORS   = [0, 1, 2]
 
-    # Epoch 0
-    group0   = init_group(rank, ALL, port_e0)
+    group    = init_group(rank, ALL, port)
     phy2log  = build_phy2log(4, FFN, NUM_LOGICAL)
     epr      = len(phy2log) // 4
     remapper = ExpertRemapper(phy2log, NUM_LOGICAL)
     active   = make_active_ranks(4)
-    m2n      = M2NBuffer(group0, ATTN, FFN, epr, MAX_DISP, HIDDEN)
+    m2n      = M2NBuffer(group, ATTN, FFN, epr, MAX_DISP, HIDDEN)
     role     = m2n.role
 
     x = (make_tokens(NUM_TOKENS, HIDDEN, rank)
@@ -444,7 +448,7 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     bar.arrive_and_wait("phase1", rank, ALL)
     log(rank, role, "T_Recovery Phase 1 PASSED")
 
-    # Phase 2
+    # Phase 2 -- detect crash via timeout
     bar.arrive_and_wait("phase2_start", rank, SURVIVORS)
     log(rank, role, "T_Recovery Phase 2: 2 s timeout crash detection")
     cx2, _, _ = run_dispatch_combine(
@@ -456,22 +460,35 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     bar.arrive_and_wait("phase2_done", rank, SURVIVORS)
     log(rank, role, "T_Recovery Phase 2 PASSED")
 
-    # Phase 3 -- destroy old group, form new group with new rank 3
-    log(rank, role, "T_Recovery Phase 3: destroy epoch-0 group (LOCAL op)")
-    dist.destroy_process_group()
-
+    # Phase 3 -- in-place recovery (NO destroy_process_group)
     log(rank, role, "T_Recovery Phase 3: waiting for new rank-3 process...")
-    bar.wait_for("new_r3_ready", [3])
+    bar.wait_for("new_r3_joined", [3])
 
-    # All 4 synchronise before forming the new group so rank-0 (TCPStore master)
-    # is guaranteed to be at its store before rank-3 tries to connect.
-    bar.arrive_and_wait("phase3_form_group", rank, ALL)
+    # Poll PG backend until ALL survivors see new rank 3's connectionPoller
+    # handshake complete (get_peer_state does allreduce(MIN) internally).
+    backend = group._get_backend(torch.device("cuda"))
+    log(rank, role, "T_Recovery Phase 3: polling get_peer_state([3])...")
+    while True:
+        (peer_connected,) = mpg.get_peer_state(backend, [3])
+        if peer_connected:
+            break
+        time.sleep(0.1)
+    log(rank, role, "T_Recovery Phase 3: new rank 3 connected to PG backend")
 
-    log(rank, role, "T_Recovery Phase 3: forming epoch-1 group")
-    group1 = init_group(rank, ALL, port_e1)
+    # Re-enable rank 3 in PG backend (sets activeRanks[3]=true, syncs taskCount)
+    mpg.recover_ranks(backend, [3])
+    log(rank, role, "T_Recovery Phase 3: recover_ranks([3]) done")
 
-    log(rank, role, "T_Recovery Phase 3: scale_up() -- new rank-3 has fresh RDMA addrs")
-    m2n.scale_up(group1, ATTN, FFN, epr)
+    # Signal new rank 3 that PG recovery is complete
+    bar.arrive("phase3_pg_recovered", rank)
+
+    # Re-exchange RDMA metadata for EP buffer layer.
+    # Survivors call update_ep_member() (= connect(is_update=True)).
+    # New rank 3 simultaneously executes M2NBuffer() constructor which calls
+    # connect() -- both sides participate in the same all_gather/all_to_all.
+    log(rank, role, "T_Recovery Phase 3: update_ep_member() ...")
+    m2n.update_ep_member()
+    log(rank, role, "T_Recovery Phase 3: update_ep_member() done")
 
     active[3] = 1
     if role == "attention":
@@ -485,7 +502,7 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     log(rank, role, "T_Recovery PASSED")
 
 
-def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port_e0: int):
+def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port: int):
     """
     Original rank 3 -- participates in Phase 1 then waits for SIGKILL.
     Never reaches Phase 2.
@@ -503,12 +520,12 @@ def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port_e0: int):
     FFN         = [2, 3]
     ALL         = [0, 1, 2, 3]
 
-    group0   = init_group(rank, ALL, port_e0)
+    group    = init_group(rank, ALL, port)
     phy2log  = build_phy2log(4, FFN, NUM_LOGICAL)
     epr      = len(phy2log) // 4
     remapper = ExpertRemapper(phy2log, NUM_LOGICAL)
     active   = make_active_ranks(4)
-    m2n      = M2NBuffer(group0, ATTN, FFN, epr, MAX_DISP, HIDDEN)
+    m2n      = M2NBuffer(group, ATTN, FFN, epr, MAX_DISP, HIDDEN)
     role     = m2n.role  # "ffn"
 
     x = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -524,18 +541,25 @@ def worker_t_recovery_rank3_orig(rank: int, barrier_dir: str, port_e0: int):
 
 
 def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
-                                 result_q: mp.Queue, port_e1: int):
+                                 result_q: mp.Queue, port: int):
     """
     NEW rank-3 process (Phase 3 only).
 
     This process has a DIFFERENT PID from the killed rank 3.
-    Its CUDA allocations use new virtual addresses.  scale_up() on survivors
-    exchanges these addresses via Buffer.connect(), proving RDMA works with
-    freshly allocated memory.
+    Its CUDA allocations use new virtual addresses.
+
+    Joins the SAME TCPStore as survivors via init_process_group with
+    isExtension=True.  The connectionPoller on survivors detects this
+    rank's new store keys and completes RDMA warmup.  After survivors
+    call recover_ranks(), the PG backend re-enables rank 3 and syncs
+    taskCount.  Then M2NBuffer() constructor calls connect() which
+    participates in the same all_gather/all_to_all as survivors'
+    update_ep_member() -- re-exchanging EP RDMA metadata.
     """
     assert rank == 3
     torch.cuda.set_device(rank)
     bar = FileBarrier(Path(barrier_dir) / "t_recovery")
+    import mooncake.pg as mpg
 
     NUM_LOGICAL = 128
     HIDDEN      = 2560
@@ -545,29 +569,52 @@ def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
     ATTN        = [0, 1]
     FFN         = [2, 3]
     ALL         = [0, 1, 2, 3]
+    SURVIVORS   = [0, 1, 2]
 
     role = "ffn"
     log(rank, role,
         f"T_Recovery Phase 3 (NEW rank 3): PID={os.getpid()} -- fresh GPU memory")
 
-    # Signal readiness immediately so survivors can proceed to Phase 3
-    bar.arrive("new_r3_ready", rank)
+    # Wait until survivors finished Phase 2
+    bar.wait_for("phase2_done", SURVIVORS)
 
-    # Wait until survivors finished Phase 2 (so they are at destroy_group step)
-    bar.wait_for("phase2_done", [0, 1, 2])
+    # Join the existing TCPStore as an extension rank (isExtension=True).
+    # The store master (rank 0) is still alive.
+    # The connectionPoller on survivors will detect our new store keys.
+    log(rank, role, "T_Recovery Phase 3: joining existing group (isExtension=True)")
+    active = make_active_ranks(4)
+    store = dist.TCPStore(
+        "127.0.0.1", port, 4, is_master=False,
+        timeout=timedelta(seconds=60),
+    )
+    dist.init_process_group(
+        backend="mooncake",
+        store=store,
+        rank=rank,
+        world_size=4,
+        pg_options=mpg.MooncakeBackendOptions(active, True),
+    )
+    group = dist.group.WORLD
+    log(rank, role, "T_Recovery Phase 3: joined group successfully")
 
-    bar.arrive_and_wait("phase3_form_group", rank, ALL)
+    # Signal survivors that our PG backend is running (connectionPoller active)
+    bar.arrive("new_r3_joined", rank)
 
-    log(rank, role, "T_Recovery Phase 3: forming epoch-1 group")
-    group1 = init_group(rank, ALL, port_e1)
+    # Wait for survivors to finish recover_ranks() before proceeding.
+    # After recover_ranks, our rank is re-enabled in activeRanks and
+    # taskCount is synced -- we can now do collectives.
+    bar.wait_for("phase3_pg_recovered", SURVIVORS)
 
+    # Build M2NBuffer -- constructor calls Buffer.connect() which does
+    # all_gather + all_to_all (collective).  Survivors simultaneously call
+    # m2n.update_ep_member() which is connect(is_update=True) -- same
+    # collective calls, so both sides participate.
+    log(rank, role,
+        "T_Recovery Phase 3: NEW M2NBuffer (connect() re-exchanges RDMA addrs)")
     phy2log  = build_phy2log(4, FFN, NUM_LOGICAL)
     epr      = len(phy2log) // 4
     remapper = ExpertRemapper(phy2log, NUM_LOGICAL)
-    active   = make_active_ranks(4)
-
-    log(rank, role, "T_Recovery Phase 3: NEW M2NBuffer (Buffer.connect exchanges new RDMA addrs)")
-    m2n = M2NBuffer(group1, ATTN, FFN, epr, MAX_DISP, HIDDEN)
+    m2n = M2NBuffer(group, ATTN, FFN, epr, MAX_DISP, HIDDEN)
 
     x = torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda")
     tidx_log, tw = make_routing(NUM_TOKENS, NUM_LOGICAL, NUM_TOPK,
@@ -807,15 +854,16 @@ def run_t_kill(coord: Coordinator) -> bool:
 
 def run_t_recovery(coord: Coordinator) -> bool:
     print("\n" + "=" * 70, flush=True)
-    print("T_Recovery: SIGKILL rank 3 -> new process -> scale_up()", flush=True)
+    print("T_Recovery: SIGKILL rank 3 -> in-place recovery "
+          "(get_peer_state + recover_ranks + update_ep_member)", flush=True)
     print("=" * 70, flush=True)
     bar = coord.bar("t_recovery")
-    pe0, pe1 = T_RECOVERY_PORT, T_RECOVERY_PORT + 1
+    port = T_RECOVERY_PORT
     for r in range(3):
         coord.spawn(r, worker_t_recovery_survivor,
-                    r, str(coord.barrier_dir), coord.result_q, pe0, pe1)
+                    r, str(coord.barrier_dir), coord.result_q, port)
     coord.spawn(3, worker_t_recovery_rank3_orig,
-                3, str(coord.barrier_dir), pe0)
+                3, str(coord.barrier_dir), port)
     bar.wait_for("phase1", [0, 1, 2, 3], timeout=180)
     print("[Coord] T_Recovery Phase 1 done -- SIGKILL rank 3", flush=True)
     coord.kill(3)
@@ -823,7 +871,7 @@ def run_t_recovery(coord: Coordinator) -> bool:
     bar.wait_for("phase2_done", [0, 1, 2], timeout=180)
     print("[Coord] T_Recovery Phase 2 done -- spawning NEW rank 3", flush=True)
     coord.spawn(3, worker_t_recovery_rank3_new,
-                3, str(coord.barrier_dir), coord.result_q, pe1)
+                3, str(coord.barrier_dir), coord.result_q, port)
     passed = coord.collect([0, 1, 2, 3], timeout=180)
     print("=" * 70, flush=True)
     print(f"T_Recovery: {'PASSED' if passed else 'FAILED'}", flush=True)
