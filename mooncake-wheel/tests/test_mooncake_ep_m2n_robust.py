@@ -560,11 +560,18 @@ def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
     log(rank, role,
         f"T_Recovery Phase 3 (NEW rank 3): PID={os.getpid()} -- fresh GPU memory")
 
-    # Signal readiness so survivors can start polling get_peer_state
-    bar.arrive("new_r3_ready", rank)
-
     # Wait until survivors finished Phase 2
     bar.wait_for("phase2_done", [0, 1, 2])
+    
+    # Give TCPStore time to clean up old rank 3 state.
+    # When the old rank 3 was killed, TCPStore needs time to detect the
+    # connection loss and clean up internal state. Without this delay,
+    # init_process_group() may encounter "Connection reset by peer" errors.
+    log(rank, role, "T_Recovery Phase 3: waiting for TCPStore cleanup...")
+    time.sleep(1.5)
+
+    # Signal readiness so survivors can start polling get_peer_state
+    bar.arrive("new_r3_ready", rank)
 
     # Join the existing group as a recovered rank using MooncakeBackendOptions
     log(rank, role, "T_Recovery Phase 3: joining existing group with is_extension=True")
